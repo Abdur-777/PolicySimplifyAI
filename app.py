@@ -1,21 +1,25 @@
-# app.py — PolicySimplify AI (Day 2)
+# app.py — PolicySimplify AI (Day 2–3)
 # ---------------------------------------------------------
-# - Sidebar ingest (upload/URL/example)
-# - Tuned AI outputs (Day 2 prompts)
-# - Risk KPIs (High/Medium/Low), triage toggle
-# - Table + details + CSV/JSON export
-# - Healthcheck (?health=1) for Render
+# - No signup required
+# - Ingest: Upload PDF, fetch by URL, or use example text
+# - AI outputs: Summary, Checklist, Risk (tuned prompts in checklist_generator.py)
+# - Vector store: FAISS if available, else NumPy fallback (vectorstore.py)
+# - Persistence: SQLite (storage.py)
+# - Exports: CSV, JSON, and Audit Pack PDF (export_audit_pack.py)
+# - Healthcheck: add ?health=1 to URL
 # ---------------------------------------------------------
 
 from __future__ import annotations
 
 import os
 import json
+import time
 import requests
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+# Local modules
 from pdf_loader import extract_text_from_pdf_bytes, chunk_text, make_docs
 from vectorstore import SimpleFAISS
 from checklist_generator import (
@@ -24,42 +28,67 @@ from checklist_generator import (
     assess_risk,
     compose_policy_card,
 )
+from storage import save_card, load_cards, clear_all
+from export_audit_pack import build_audit_pack
 
-# --------------------- Setup ---------------------
+# --------------------- Setup & Config ---------------------
 load_dotenv()
+
 APP_NAME = os.getenv("APP_NAME", "PolicySimplify AI")
 APP_TAGLINE = os.getenv("APP_TAGLINE", "Turn any government policy into an instant compliance checklist.")
 VECTOR_DB_NAME = os.getenv("VECTOR_DB_NAME", "demo_store")
 COUNCIL_NAME = os.getenv("COUNCIL_NAME", "Wyndham City Council")
-TEXT_CAP = int(os.getenv("TEXT_CAP", "120000"))
+TEXT_CAP = int(os.getenv("TEXT_CAP", "120000"))  # safety cap for very large PDFs
 
 st.set_page_config(page_title=APP_NAME, page_icon="✅", layout="wide")
 
-# Healthcheck
+# Healthcheck for Render/monitors: https://your-app-url/?health=1
 if st.experimental_get_query_params().get("health") == ["1"]:
     st.write("ok")
     st.stop()
 
-# --------------------- Session ---------------------
+# --------------------- Session State ----------------------
 if "store" not in st.session_state:
     st.session_state["store"] = SimpleFAISS.load(VECTOR_DB_NAME)
 if "policy_cards" not in st.session_state:
     st.session_state["policy_cards"] = []
+if "loaded_persisted" not in st.session_state:
+    # Preload persisted cards once per session
+    persisted = load_cards(limit=500)
+    if persisted:
+        st.session_state["policy_cards"].extend(persisted)
+    st.session_state["loaded_persisted"] = True
 
-# --------------------- Header ---------------------
+# --------------------- Header / Branding ------------------
 hdr_left, hdr_right = st.columns([0.75, 0.25])
 with hdr_left:
     st.markdown(f"## {APP_NAME}")
     st.markdown(f"_{APP_TAGLINE}_")
 with hdr_right:
-    st.markdown(f"<div style='text-align:right;'>🏛️ {COUNCIL_NAME}<br/>🔒 No sign-up • Demo-ready</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='text-align:right;'>🏛️ {COUNCIL_NAME}<br/>🔒 No sign-up • Demo-ready</div>",
+        unsafe_allow_html=True,
+    )
 st.divider()
 
-# --------------------- Sidebar Ingest ---------------------
+# --------------------- Sidebar (Ingest & Admin) -----------
 with st.sidebar:
     st.markdown("### Ingest a policy")
-    uploaded = st.file_uploader("Upload PDF", type=["pdf"])
 
+    # Upload
+    uploaded = st.file_uploader("Upload PDF", type=["pdf"])
+    if uploaded is not None:
+        if st.button("Process uploaded PDF"):
+            try:
+                content = uploaded.read()
+                source_name = uploaded.name
+                # process immediately
+                pass_bytes = content  # keep scope local
+                st.session_state["_ingest_uploaded"] = (source_name, pass_bytes)
+            except Exception as e:
+                st.error(f"Could not read uploaded file: {e}")
+
+    # URL fetch
     url = st.text_input("Or fetch from URL (PDF)", placeholder="https://example.gov.au/policy.pdf")
     if st.button("Fetch & process URL"):
         if not url.strip():
@@ -69,28 +98,32 @@ with st.sidebar:
                 with st.spinner("Downloading PDF..."):
                     r = requests.get(url, timeout=20)
                     r.raise_for_status()
-                st.session_state["_pending_url_pdf"] = (os.path.basename(url) or "Policy_From_URL.pdf", r.content)
+                st.session_state["_ingest_url"] = (os.path.basename(url) or "Policy_From_URL.pdf", r.content)
+                st.success("Downloaded. Processing…")
             except Exception as e:
                 st.error(f"Failed to fetch PDF: {e}")
 
     st.markdown("---")
     if st.button("Use example policy"):
-        st.session_state["_pending_example"] = True
+        st.session_state["_ingest_example"] = True
 
     st.markdown("---")
-    if st.button("🗑️ Clear session"):
+    if st.button("🗑️ Clear session & database"):
         st.session_state["policy_cards"] = []
         st.session_state["store"] = SimpleFAISS.load(VECTOR_DB_NAME)
-        st.success("Cleared session for this demo.")
+        try:
+            clear_all()
+        except Exception as e:
+            st.warning(f"DB clear error: {e}")
+        st.success("Cleared session and database.")
 
-    # Diagnostics
     st.markdown("---")
     st.caption("Diagnostics")
     backend = "FAISS" if hasattr(st.session_state["store"], "index") and st.session_state["store"].index is not None else "NumPy"
     st.write(f"Vector backend: **{backend}**")
     st.write(f"Indexed docs: **{len(getattr(st.session_state['store'], 'docs', []))}**")
 
-# --------------------- Example Text ---------------------
+# --------------------- Example Text -----------------------
 example_text = """Policy Directive: Waste Services Bin Contamination
 
 1. Households must not place hazardous items (batteries, chemicals) in general waste.
@@ -103,6 +136,10 @@ Penalties apply for non-compliance. Council teams must document outreach and enf
 
 # --------------------- Core Processor ---------------------
 def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_text: str | None = None):
+    """
+    Reads, indexes, and generates summary/checklist/risk for a policy.
+    Appends a policy card dict into session state and persists to DB.
+    """
     # 1) Extract text
     with st.spinner("Reading policy..."):
         if file_bytes:
@@ -111,7 +148,7 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
             text = raw_text or ""
         text = (text or "").strip()
         if not text:
-            st.warning("No text found (scanned PDF without OCR?).")
+            st.warning("No text found (this may be a scanned PDF without OCR).")
             return
         if len(text) > TEXT_CAP:
             text = text[:TEXT_CAP]
@@ -135,21 +172,29 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
         except Exception as e:
             st.error(f"OpenAI error: {e}")
             return
+
         card = compose_policy_card(source_name, summary, checklist, risk_note)
+        card["created_at"] = int(time.time())
         st.session_state["policy_cards"].append(card)
+        # Persist
+        try:
+            save_card(card)
+        except Exception as e:
+            st.warning(f"Could not persist to DB: {e}")
 
-# Trigger processing from sidebar actions
-if uploaded is not None and st.sidebar.button("Process uploaded PDF"):
-    process_policy(source_name=uploaded.name, file_bytes=uploaded.read())
+# Trigger processing for any queued ingest actions
+if "_ingest_uploaded" in st.session_state:
+    name, bytes_ = st.session_state.pop("_ingest_uploaded")
+    process_policy(source_name=name, file_bytes=bytes_)
 
-if st.session_state.pop("_pending_url_pdf", None):
-    name, content = st.session_state["_pending_url_pdf"]
-    process_policy(source_name=name, file_bytes=content)
+if "_ingest_url" in st.session_state:
+    name, bytes_ = st.session_state.pop("_ingest_url")
+    process_policy(source_name=name, file_bytes=bytes_)
 
-if st.session_state.pop("_pending_example", False):
+if st.session_state.pop("_ingest_example", False):
     process_policy(source_name="Example_Waste_Services_Policy.txt", raw_text=example_text)
 
-# --------------------- Risk KPIs ---------------------
+# --------------------- Risk KPIs --------------------------
 def _count_bullets(text: str) -> int:
     # Heuristic: lines starting with '-', '*', '•', or numbered '1.' etc.
     cnt = 0
@@ -159,11 +204,11 @@ def _count_bullets(text: str) -> int:
             continue
         if s.startswith(("-", "*", "•")):
             cnt += 1
-        elif s[:2].isdigit() and (s[2:3] == "." or s[1:2] == "."):
+        elif (len(s) > 1 and s[0].isdigit() and s[1] == ".") or (len(s) > 2 and s[:2].isdigit() and s[2] == "."):
             cnt += 1
     return cnt
 
-def _risk_counts(cards: list[dict]) -> tuple[int,int,int,int]:
+def _risk_counts(cards: list[dict]) -> tuple[int, int, int, int]:
     total_obligations = sum(_count_bullets(c.get("checklist", "")) for c in cards)
     high = sum(1 for c in cards if c.get("risk") == "High")
     med = sum(1 for c in cards if c.get("risk") == "Medium")
@@ -184,9 +229,8 @@ else:
 
 st.divider()
 
-# --------------------- Table & Details ---------------------
+# --------------------- Table & Details --------------------
 st.markdown("### 2) Active compliance items")
-
 if not st.session_state["policy_cards"]:
     st.info("Upload a PDF, paste a policy URL, or use the example.")
 else:
@@ -199,15 +243,16 @@ else:
                 "Checklist (actions)": c["checklist"],
                 "Risk": c["risk"],
                 "Risk explainer": c["risk_explainer"],
+                "Processed": time.strftime("%Y-%m-%d %H:%M", time.localtime(c.get("created_at", 0))) if c.get("created_at") else "",
             }
             for c in st.session_state["policy_cards"]
         ]
     )
 
-    # Sort by risk (High > Medium > Low)
+    # Sort by risk (High > Medium > Low), then latest
     risk_order = {"High": 0, "Medium": 1, "Low": 2}
     df["_risk_order"] = df["Risk"].map(risk_order).fillna(3)
-    df = df.sort_values(by=["_risk_order", "Policy"]).drop(columns=["_risk_order"])
+    df = df.sort_values(by=["_risk_order", "Processed", "Policy"], ascending=[True, False, True]).drop(columns=["_risk_order"])
 
     # Filters
     colA, colB = st.columns([0.7, 0.3])
@@ -221,7 +266,7 @@ else:
     else:
         view_df = df[df["Risk"].isin(risk_filter)].reset_index(drop=True)
 
-    st.dataframe(view_df, use_container_width=True, height=380)
+    st.dataframe(view_df, use_container_width=True, height=420)
 
     # Detail viewer
     st.markdown("#### Policy details")
@@ -230,6 +275,7 @@ else:
         row = view_df.iloc[int(idx)]
         st.markdown(f"**Policy:** {row['Policy']}")
         st.markdown(f"**Risk:** {row['Risk']}")
+        st.markdown(f"**Processed:** {row['Processed']}")
         st.markdown("**Summary:**")
         st.write(row["Summary (plain-English)"])
         st.markdown("**Checklist:**")
@@ -240,21 +286,43 @@ else:
     # Exports
     st.markdown("#### Export")
     csv_bytes = view_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download table as CSV", data=csv_bytes, file_name="policy_compliance_items.csv", mime="text/csv", use_container_width=True)
+    st.download_button(
+        "Download table as CSV",
+        data=csv_bytes,
+        file_name="policy_compliance_items.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
     json_bytes = json.dumps(view_df.to_dict(orient="records"), indent=2).encode("utf-8")
-    st.download_button("Download table as JSON", data=json_bytes, file_name="policy_compliance_items.json", mime="application/json", use_container_width=True)
+    st.download_button(
+        "Download table as JSON",
+        data=json_bytes,
+        file_name="policy_compliance_items.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    # Audit Pack PDF (all cards so auditors get full context)
+    pdf_bytes = build_audit_pack(COUNCIL_NAME, st.session_state["policy_cards"])
+    st.download_button(
+        "Download Audit Pack (PDF)",
+        data=pdf_bytes,
+        file_name="PolicySimplify_Audit_Pack.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
 
 st.divider()
 
-# --------------------- Future Hooks ---------------------
-st.markdown("### 3) Export & alerts (demo stubs)")
+# --------------------- Future Hooks / Stubs ---------------
+st.markdown("### 3) Integrations (coming soon)")
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.button("Export Audit Pack (PDF) — Coming soon")
-with c2:
     st.button("Email Weekly Digest — Coming soon")
-with c3:
+with c2:
     st.button("Assign in MS Teams — Coming soon")
+with c3:
+    st.button("GovShare Export — Coming soon")
 
 st.caption("© 2025 PolicySimplify AI — Demo build")
