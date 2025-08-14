@@ -1,21 +1,14 @@
-"""
-checklist_generator.py — Day 4
-- Tuned, structured outputs for gov readers
-- Lazy OpenAI client (avoids proxy kwargs)
-- Adds qa_answer() for retrieval Q&A
-"""
+# checklist_generator.py — Day 6
 
 from __future__ import annotations
 import os
 from typing import Dict, List
 from dotenv import load_dotenv
-from openai import OpenAI
+from llm_client import chat as _llm_chat
 
 load_dotenv()
-
 CHAT_MODEL = os.getenv("OPENAI_MODEL_CHAT", "gpt-4o-mini")
 
-# Truncation limits (tune via .env)
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "12000"))
 CHECKLIST_MAX_CHARS = int(os.getenv("CHECKLIST_MAX_CHARS", "10000"))
 RISK_MAX_CHARS = int(os.getenv("RISK_MAX_CHARS", "8000"))
@@ -55,21 +48,11 @@ QA_SYS = (
   "Be concise (1–3 sentences) and avoid legalese."
 )
 
-def _client() -> OpenAI:
-    # Let SDK read OPENAI_API_KEY from env
-    return OpenAI()
-
 def _chat(system_prompt: str, user_prompt: str, model: str = CHAT_MODEL) -> str:
-    client = _client()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
+    return _llm_chat(model, [
+        {"role":"system","content":system_prompt},
+        {"role":"user","content":user_prompt},
+    ],)
 
 def generate_summary(text: str) -> str:
     prompt = f"POLICY TEXT (truncated):\n{text[:SUMMARY_MAX_CHARS]}"
@@ -84,38 +67,23 @@ def generate_checklist(text: str, summary: str) -> str:
     return _chat(CHECKLIST_SYS, prompt)
 
 def assess_risk(text: str, summary: str) -> str:
-    prompt = (
-        f"POLICY TEXT (truncated):\n{text[:RISK_MAX_CHARS]}\n\n"
-        f"SUMMARY FOR CONTEXT:\n{summary}"
-    )
+    prompt = f"POLICY TEXT (truncated):\n{text[:RISK_MAX_CHARS]}\n\nSUMMARY FOR CONTEXT:\n{summary}"
     return _chat(RISK_SYS, prompt)
 
 def qa_answer(snippets: List[str], question: str, model: str = CHAT_MODEL) -> str:
-    client = _client()
     context = "\n\n---\n\n".join(snippets[:6])
     prompt = f"CONTEXT SNIPPETS:\n{context}\n\nQUESTION:\n{question}\n\nAnswer:"
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role":"system","content":QA_SYS},
-            {"role":"user","content":prompt},
-        ],
-        temperature=0.1,
-    )
-    return resp.choices[0].message.content.strip()
+    return _llm_chat(model, [
+        {"role":"system","content":QA_SYS},
+        {"role":"user","content":prompt},
+    ])
 
 def compose_policy_card(source_name: str, summary: str, checklist: str, risk_note: str) -> Dict:
-    # Determine risk label from the first non-empty line
     first_line = next((ln.strip() for ln in risk_note.splitlines() if ln.strip()), "").lower()
-    if first_line.startswith("high"):
-        risk_label = "High"
-    elif first_line.startswith("medium"):
-        risk_label = "Medium"
-    elif first_line.startswith("low"):
-        risk_label = "Low"
-    else:
-        risk_label = "Medium"
-
+    if first_line.startswith("high"): risk_label = "High"
+    elif first_line.startswith("medium"): risk_label = "Medium"
+    elif first_line.startswith("low"): risk_label = "Low"
+    else: risk_label = "Medium"
     return {
         "policy": source_name,
         "summary": summary,
