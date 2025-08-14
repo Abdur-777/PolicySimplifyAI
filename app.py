@@ -1,18 +1,22 @@
-# app.py — PolicySimplify AI (Day 4)
+# app.py — PolicySimplify AI (Day 5)
 # ---------------------------------------------------------
 # - Ingest: upload/pdf URL/example (no signup)
 # - AI: Summary / Checklist / Risk (tuned), Retrieval Q&A
 # - Vector store: FAISS or NumPy fallback (vectorstore.py)
 # - Persistence: SQLite (cards + events) with retention
-# - Exports: CSV/JSON + Audit Pack PDF
+# - Exports: CSV/JSON + Audit Pack PDF + Email Audit Pack
+# - Soft access control: APP_PASSCODE
+# - Logging: structured to stdout
 # - Healthcheck: add ?health=1
 # ---------------------------------------------------------
 
 from __future__ import annotations
 
 import os
+import sys
 import json
 import time
+import logging
 import requests
 import pandas as pd
 import streamlit as st
@@ -34,12 +38,21 @@ from utils import extract_structured_tasks
 # --------------------- Setup & Config ---------------------
 load_dotenv()
 
+# Logging (stdout for Render/Docker)
+logging.basicConfig(
+    stream=sys.stdout,
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("policysimplify")
+
 APP_NAME = os.getenv("APP_NAME", "PolicySimplify AI")
 APP_TAGLINE = os.getenv("APP_TAGLINE", "Turn any government policy into an instant compliance checklist.")
 VECTOR_DB_NAME = os.getenv("VECTOR_DB_NAME", "demo_store")
 COUNCIL_NAME = os.getenv("COUNCIL_NAME", "Wyndham City Council")
 TEXT_CAP = int(os.getenv("TEXT_CAP", "120000"))  # safety cap for very large PDFs
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "14"))
+PASSCODE = os.getenv("APP_PASSCODE", "")
 
 st.set_page_config(page_title=APP_NAME, page_icon="✅", layout="wide")
 
@@ -48,10 +61,28 @@ if st.experimental_get_query_params().get("health") == ["1"]:
     st.write("ok")
     st.stop()
 
+# --- Soft auth gate (demo/prod toggle) ---
+if PASSCODE:
+    if "auth_ok" not in st.session_state:
+        st.session_state["auth_ok"] = False
+    if not st.session_state["auth_ok"]:
+        st.warning("Restricted: enter access code to continue.")
+        code = st.text_input("Access code", type="password")
+        if st.button("Enter"):
+            if code == PASSCODE:
+                st.session_state["auth_ok"] = True
+                st.experimental_rerun()
+            else:
+                st.error("Incorrect code.")
+        st.stop()
+
 # Purge old data on startup (light governance)
 try:
     removed = purge_older_than(RETENTION_DAYS)
-except Exception:
+    if removed:
+        log.info("Purged old rows (days=%s, removed=%s)", RETENTION_DAYS, removed)
+except Exception as e:
+    log.warning("Purge failed: %s", e)
     removed = 0
 
 # --------------------- Session State ----------------------
@@ -63,6 +94,7 @@ if "loaded_persisted" not in st.session_state:
     persisted = load_cards(limit=500)
     if persisted:
         st.session_state["policy_cards"].extend(persisted)
+        log.info("Loaded persisted policy cards: %s", len(persisted))
     st.session_state["loaded_persisted"] = True
 
 # --------------------- Header / Branding ------------------
@@ -91,8 +123,10 @@ with st.sidebar:
                 source_name = uploaded.name
                 st.session_state["_ingest_uploaded"] = (source_name, content)
                 log_event("upload", source_name)
+                log.info("Queued uploaded PDF: %s (%s bytes)", source_name, len(content))
             except Exception as e:
                 st.error(f"Could not read uploaded file: {e}")
+                log.exception("Upload read failed")
 
     # URL fetch
     url = st.text_input("Or fetch from URL (PDF)", placeholder="https://example.gov.au/policy.pdf")
@@ -107,13 +141,16 @@ with st.sidebar:
                 st.session_state["_ingest_url"] = (os.path.basename(url) or "Policy_From_URL.pdf", r.content)
                 st.success("Downloaded. Processing…")
                 log_event("url", url)
+                log.info("Downloaded URL PDF: %s (%s bytes)", url, len(r.content))
             except Exception as e:
                 st.error(f"Failed to fetch PDF: {e}")
+                log.exception("URL fetch failed")
 
     st.markdown("---")
     if st.button("Use example policy"):
         st.session_state["_ingest_example"] = True
         log_event("example", "Example_Waste_Services_Policy.txt")
+        log.info("Queued example policy")
 
     st.markdown("---")
     if st.button("🗑️ Clear session & database"):
@@ -123,8 +160,10 @@ with st.sidebar:
             clear_all()
         except Exception as e:
             st.warning(f"DB clear error: {e}")
+            log.exception("DB clear failed")
         st.success("Cleared session and database.")
         log_event("admin", "clear_all")
+        log.info("Cleared session + DB")
 
     st.markdown("---")
     st.caption("Diagnostics")
@@ -154,12 +193,14 @@ example_text = """Policy Directive: Waste Services Bin Contamination
 Penalties apply for non-compliance. Council teams must document outreach and enforcement actions.
 """
 
-# --------------------- Core Processor (FULL) --------------
+# --------------------- Core Processor ---------------------
 def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_text: str | None = None):
     """
     Reads, indexes, and generates summary/checklist/risk for a policy.
     Appends a policy card dict into session state and persists to DB.
     """
+    log.info("Processing policy: %s", source_name)
+
     # 1) Extract text
     with st.spinner("Reading policy..."):
         if file_bytes:
@@ -169,8 +210,10 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
         text = (text or "").strip()
         if not text:
             st.warning("No text found (this may be a scanned PDF without OCR).")
+            log.warning("Empty text after extraction: %s", source_name)
             return
         if len(text) > TEXT_CAP:
+            log.info("Text truncated from %s to %s chars", len(text), TEXT_CAP)
             text = text[:TEXT_CAP]
 
     # 2) Chunk & docs
@@ -181,6 +224,7 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
     with st.spinner("Indexing..."):
         st.session_state["store"].add(docs)
         st.session_state["store"].save(VECTOR_DB_NAME)
+        log.info("Indexed %s chunks for %s", len(docs), source_name)
 
     # 4) AI outputs (middle chunk for speed)
     with st.spinner("Generating summary, checklist & risk..."):
@@ -191,6 +235,7 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
             risk_note = assess_risk(snippet, summary)
         except Exception as e:
             st.error(f"OpenAI error: {e}")
+            log.exception("OpenAI generation failed")
             return
 
         # Compose card
@@ -205,6 +250,7 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
             save_card(card)
         except Exception as e:
             st.warning(f"Could not persist to DB: {e}")
+            log.exception("DB save failed")
 
 # Trigger processing for queued ingest actions
 if "_ingest_uploaded" in st.session_state:
@@ -352,6 +398,26 @@ else:
         use_container_width=True,
     )
 
+    # Email Audit Pack
+    with st.expander("Email this Audit Pack"):
+        to = st.text_input("Recipient email", key="email_to")
+        if st.button("Send Audit Pack", key="send_email_btn"):
+            try:
+                from email_utils import send_email_with_pdf
+                send_email_with_pdf(
+                    to_addr=to,
+                    subject=f"[{COUNCIL_NAME}] PolicySimplify Audit Pack",
+                    body="Attached: Audit Pack generated by PolicySimplify AI.",
+                    pdf_bytes=pdf_bytes,
+                    filename="PolicySimplify_Audit_Pack.pdf",
+                )
+                st.success("Sent!")
+                log_event("email", f"to={to}")
+                log.info("Audit Pack emailed to %s", to)
+            except Exception as e:
+                st.error(f"Email failed: {e}")
+                log.exception("Email send failed")
+
 st.divider()
 
 # --------------------- Retrieval Q&A ----------------------
@@ -373,5 +439,8 @@ if st.button("Get answer") and q.strip():
                 st.code(doc["text"][:700])
         try:
             log_event("qa", q)
+            log.info("Q&A answered: %s", q)
         except Exception:
             pass
+
+st.caption("© 2025 PolicySimplify AI — Demo build")
