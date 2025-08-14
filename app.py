@@ -1,12 +1,11 @@
-# app.py — PolicySimplify AI (Day 2–3)
+# app.py — PolicySimplify AI (Day 4)
 # ---------------------------------------------------------
-# - No signup required
-# - Ingest: Upload PDF, fetch by URL, or use example text
-# - AI outputs: Summary, Checklist, Risk (tuned prompts in checklist_generator.py)
-# - Vector store: FAISS if available, else NumPy fallback (vectorstore.py)
-# - Persistence: SQLite (storage.py)
-# - Exports: CSV, JSON, and Audit Pack PDF (export_audit_pack.py)
-# - Healthcheck: add ?health=1 to URL
+# - Ingest: upload/pdf URL/example (no signup)
+# - AI: Summary / Checklist / Risk (tuned), Retrieval Q&A
+# - Vector store: FAISS or NumPy fallback (vectorstore.py)
+# - Persistence: SQLite (cards + events) with retention
+# - Exports: CSV/JSON + Audit Pack PDF
+# - Healthcheck: add ?health=1
 # ---------------------------------------------------------
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# Local modules
 from pdf_loader import extract_text_from_pdf_bytes, chunk_text, make_docs
 from vectorstore import SimpleFAISS
 from checklist_generator import (
@@ -27,9 +25,11 @@ from checklist_generator import (
     generate_checklist,
     assess_risk,
     compose_policy_card,
+    qa_answer,
 )
-from storage import save_card, load_cards, clear_all
+from storage import save_card, load_cards, clear_all, log_event, recent_events, purge_older_than
 from export_audit_pack import build_audit_pack
+from utils import extract_structured_tasks
 
 # --------------------- Setup & Config ---------------------
 load_dotenv()
@@ -39,13 +39,20 @@ APP_TAGLINE = os.getenv("APP_TAGLINE", "Turn any government policy into an insta
 VECTOR_DB_NAME = os.getenv("VECTOR_DB_NAME", "demo_store")
 COUNCIL_NAME = os.getenv("COUNCIL_NAME", "Wyndham City Council")
 TEXT_CAP = int(os.getenv("TEXT_CAP", "120000"))  # safety cap for very large PDFs
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "14"))
 
 st.set_page_config(page_title=APP_NAME, page_icon="✅", layout="wide")
 
-# Healthcheck for Render/monitors: https://your-app-url/?health=1
+# Healthcheck for monitors: https://your-app-url/?health=1
 if st.experimental_get_query_params().get("health") == ["1"]:
     st.write("ok")
     st.stop()
+
+# Purge old data on startup (light governance)
+try:
+    removed = purge_older_than(RETENTION_DAYS)
+except Exception:
+    removed = 0
 
 # --------------------- Session State ----------------------
 if "store" not in st.session_state:
@@ -53,14 +60,13 @@ if "store" not in st.session_state:
 if "policy_cards" not in st.session_state:
     st.session_state["policy_cards"] = []
 if "loaded_persisted" not in st.session_state:
-    # Preload persisted cards once per session
     persisted = load_cards(limit=500)
     if persisted:
         st.session_state["policy_cards"].extend(persisted)
     st.session_state["loaded_persisted"] = True
 
 # --------------------- Header / Branding ------------------
-hdr_left, hdr_right = st.columns([0.75, 0.25])
+hdr_left, hdr_right = st.columns([0.70, 0.30])
 with hdr_left:
     st.markdown(f"## {APP_NAME}")
     st.markdown(f"_{APP_TAGLINE}_")
@@ -69,6 +75,7 @@ with hdr_right:
         f"<div style='text-align:right;'>🏛️ {COUNCIL_NAME}<br/>🔒 No sign-up • Demo-ready</div>",
         unsafe_allow_html=True,
     )
+st.info("Your uploads are processed for this demo and are **not** used to train models.")
 st.divider()
 
 # --------------------- Sidebar (Ingest & Admin) -----------
@@ -82,9 +89,8 @@ with st.sidebar:
             try:
                 content = uploaded.read()
                 source_name = uploaded.name
-                # process immediately
-                pass_bytes = content  # keep scope local
-                st.session_state["_ingest_uploaded"] = (source_name, pass_bytes)
+                st.session_state["_ingest_uploaded"] = (source_name, content)
+                log_event("upload", source_name)
             except Exception as e:
                 st.error(f"Could not read uploaded file: {e}")
 
@@ -100,12 +106,14 @@ with st.sidebar:
                     r.raise_for_status()
                 st.session_state["_ingest_url"] = (os.path.basename(url) or "Policy_From_URL.pdf", r.content)
                 st.success("Downloaded. Processing…")
+                log_event("url", url)
             except Exception as e:
                 st.error(f"Failed to fetch PDF: {e}")
 
     st.markdown("---")
     if st.button("Use example policy"):
         st.session_state["_ingest_example"] = True
+        log_event("example", "Example_Waste_Services_Policy.txt")
 
     st.markdown("---")
     if st.button("🗑️ Clear session & database"):
@@ -116,12 +124,24 @@ with st.sidebar:
         except Exception as e:
             st.warning(f"DB clear error: {e}")
         st.success("Cleared session and database.")
+        log_event("admin", "clear_all")
 
     st.markdown("---")
     st.caption("Diagnostics")
     backend = "FAISS" if hasattr(st.session_state["store"], "index") and st.session_state["store"].index is not None else "NumPy"
     st.write(f"Vector backend: **{backend}**")
     st.write(f"Indexed docs: **{len(getattr(st.session_state['store'], 'docs', []))}**")
+    st.write(f"Retention (days): **{RETENTION_DAYS}**  | Purged: **{removed}**")
+
+    st.markdown("---")
+    st.caption("Recent activity")
+    try:
+        events = recent_events(5)
+        for e in events:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["ts"]))
+            st.write(f"- {ts}: {e['kind']} — {e['detail']}")
+    except Exception:
+        st.write("- (no events yet)")
 
 # --------------------- Example Text -----------------------
 example_text = """Policy Directive: Waste Services Bin Contamination
@@ -134,7 +154,7 @@ example_text = """Policy Directive: Waste Services Bin Contamination
 Penalties apply for non-compliance. Council teams must document outreach and enforcement actions.
 """
 
-# --------------------- Core Processor ---------------------
+# --------------------- Core Processor (FULL) --------------
 def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_text: str | None = None):
     """
     Reads, indexes, and generates summary/checklist/risk for a policy.
@@ -173,16 +193,20 @@ def process_policy(source_name: str, *, file_bytes: bytes | None = None, raw_tex
             st.error(f"OpenAI error: {e}")
             return
 
+        # Compose card
         card = compose_policy_card(source_name, summary, checklist, risk_note)
         card["created_at"] = int(time.time())
+        # Structured tasks (Action / Owner / Due)
+        card["structured_tasks"] = extract_structured_tasks(card["checklist"])
+
+        # Save to memory and DB
         st.session_state["policy_cards"].append(card)
-        # Persist
         try:
             save_card(card)
         except Exception as e:
             st.warning(f"Could not persist to DB: {e}")
 
-# Trigger processing for any queued ingest actions
+# Trigger processing for queued ingest actions
 if "_ingest_uploaded" in st.session_state:
     name, bytes_ = st.session_state.pop("_ingest_uploaded")
     process_policy(source_name=name, file_bytes=bytes_)
@@ -196,7 +220,6 @@ if st.session_state.pop("_ingest_example", False):
 
 # --------------------- Risk KPIs --------------------------
 def _count_bullets(text: str) -> int:
-    # Heuristic: lines starting with '-', '*', '•', or numbered '1.' etc.
     cnt = 0
     for ln in (text or "").splitlines():
         s = ln.strip()
@@ -226,7 +249,6 @@ else:
     m3.metric("Medium Risk Policies", med_c)
     m4.metric("Low Risk Policies", low_c)
     st.caption(f"Approx. obligations extracted: **{total_obl}**")
-
 st.divider()
 
 # --------------------- Table & Details --------------------
@@ -283,6 +305,23 @@ else:
         st.markdown("**Risk explainer:**")
         st.write(row["Risk explainer"])
 
+    # Structured view across selected rows
+    st.markdown("#### Structured view (Action / Owner / Due)")
+    if st.toggle("Show structured tasks", value=False):
+        rows = []
+        # Map policy -> card to access structured_tasks
+        card_map = {c["policy"]: c for c in st.session_state["policy_cards"]}
+        for rec in view_df.to_dict(orient="records"):
+            c = card_map.get(rec["Policy"])
+            if not c:
+                continue
+            for t in c.get("structured_tasks", []):
+                rows.append({"Policy": rec["Policy"], "Action": t.get("action",""), "Owner": t.get("owner",""), "Due": t.get("due","")})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.info("No structured tasks yet for current selection.")
+
     # Exports
     st.markdown("#### Export")
     csv_bytes = view_df.to_csv(index=False).encode("utf-8")
@@ -315,14 +354,24 @@ else:
 
 st.divider()
 
-# --------------------- Future Hooks / Stubs ---------------
-st.markdown("### 3) Integrations (coming soon)")
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.button("Email Weekly Digest — Coming soon")
-with c2:
-    st.button("Assign in MS Teams — Coming soon")
-with c3:
-    st.button("GovShare Export — Coming soon")
-
-st.caption("© 2025 PolicySimplify AI — Demo build")
+# --------------------- Retrieval Q&A ----------------------
+st.markdown("### 3) Ask the policy")
+q = st.text_input("Ask a question about your uploaded policies")
+if st.button("Get answer") and q.strip():
+    hits = st.session_state["store"].search(q, k=4)  # list[(score, doc)]
+    snippets = [doc["text"] for _, doc in hits]
+    if not snippets:
+        st.info("No context found yet. Upload a policy first.")
+    else:
+        ans = qa_answer(snippets, q)
+        st.markdown("**Answer:**")
+        st.write(ans)
+        with st.expander("Sources"):
+            for i, (score, doc) in enumerate(hits, 1):
+                src = doc.get("metadata", {}).get("source", "Unknown")
+                st.markdown(f"**{i}. {src}** (score {score:.2f})")
+                st.code(doc["text"][:700])
+        try:
+            log_event("qa", q)
+        except Exception:
+            pass
