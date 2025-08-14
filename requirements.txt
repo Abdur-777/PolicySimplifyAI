@@ -4,9 +4,17 @@ python-dotenv==1.0.1
 pypdf==4.3.1
 tqdm==4.66.5
 numpy==1.26.4
-# optional faiss-cpu (keep, but your fallback handles absence)
 faiss-cpu==1.8.0.post1
 
 pandas==2.3.1
 fpdf2==2.7.9
 requests==2.32.4
+
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.11.7
+regex==2024.11.6
+
+pytesseract==0.3.13
+Pillow==10.4.0
+pypdfium2==4.30.0
