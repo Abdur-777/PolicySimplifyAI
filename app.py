@@ -1,4 +1,4 @@
-# app.py — PolicySimplify AI (Day 6, no passcode, new query_params API)
+# app.py — PolicySimplify AI (Day 7: white-label branding, no passcode)
 
 from __future__ import annotations
 import os
@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from brand import get_brand, inject_theme
 from pdf_loader import extract_text_from_pdf_bytes, chunk_text, make_docs
 from vectorstore import SimpleFAISS
 from checklist_generator import (
@@ -40,7 +41,8 @@ log = logging.getLogger("policysimplify")
 APP_NAME        = os.getenv("APP_NAME", "PolicySimplify AI")
 APP_TAGLINE     = os.getenv("APP_TAGLINE", "Turn any government policy into an instant compliance checklist.")
 VECTOR_DB_NAME  = os.getenv("VECTOR_DB_NAME", "demo_store")
-COUNCIL_NAME    = os.getenv("COUNCIL_NAME", "Wyndham City Council")
+# COUNCIL_NAME can be overridden by env; otherwise brand.json "name" is used below.
+ENV_COUNCIL     = os.getenv("COUNCIL_NAME", "").strip()
 TEXT_CAP        = int(os.getenv("TEXT_CAP", "120000"))
 RETENTION_DAYS  = int(os.getenv("RETENTION_DAYS", "14"))
 ALLOW_DB_EXPORT = os.getenv("ALLOW_DB_EXPORT", "false").lower() == "true"
@@ -48,11 +50,16 @@ ENABLE_OCR      = os.getenv("ENABLE_OCR", "false").lower() == "true"
 
 st.set_page_config(page_title=APP_NAME, page_icon="✅", layout="wide")
 
-# Healthcheck (new Streamlit API)
+# Healthcheck (Streamlit modern API)
 params = st.query_params
 if params.get("health") in ("1", ["1"]):
     st.write("ok")
     st.stop()
+
+# Resolve brand & theme (white-label)
+brand_key, BRAND, BRAND_LOGO = get_brand()
+inject_theme(BRAND)
+COUNCIL_NAME = ENV_COUNCIL or BRAND.get("name", "Your Council")
 
 # Purge old rows on startup (data retention)
 try:
@@ -77,17 +84,20 @@ if "loaded_persisted" not in st.session_state:
 
 # ---------- Header ----------
 
-c1, c2 = st.columns([0.7, 0.3])
+c1, c2 = st.columns([0.82, 0.18])
 with c1:
     st.markdown(f"## {APP_NAME}")
     st.markdown(f"_{APP_TAGLINE}_")
 with c2:
-    st.markdown(
-        f"<div style='text-align:right;'>🏛️ {COUNCIL_NAME}<br/>🔒 No sign-up • Demo-ready</div>",
-        unsafe_allow_html=True,
-    )
+    try:
+        st.image(BRAND_LOGO, use_column_width=True, caption=BRAND.get("logo_alt", COUNCIL_NAME))
+    except Exception:
+        st.markdown(f"<div style='text-align:right;'>🏛️ {COUNCIL_NAME}</div>", unsafe_allow_html=True)
 
-st.info("Your uploads are processed for this demo and are **not** used to train models.")
+st.caption(
+    "This demo processes your uploads to generate summaries/checklists. "
+    "Your data is **not** used to train models."
+)
 st.divider()
 
 # ---------- Sidebar (ingest, tools, diagnostics) ----------
@@ -96,7 +106,7 @@ with st.sidebar:
     st.markdown("### Ingest a policy")
 
     uploaded = st.file_uploader("Upload PDF", type=["pdf"])
-    if uploaded is not None and st.button("Process uploaded PDF"):
+    if uploaded is not None and st.button("Process uploaded PDF", use_container_width=True):
         try:
             content = uploaded.read()
             source_name = uploaded.name
@@ -108,7 +118,7 @@ with st.sidebar:
             log.exception("Upload read failed")
 
     url = st.text_input("Or fetch from URL (PDF)", placeholder="https://example.gov.au/policy.pdf")
-    if st.button("Fetch & process URL"):
+    if st.button("Fetch & process URL", use_container_width=True):
         if not url.strip():
             st.warning("Please paste a valid URL to a PDF.")
         else:
@@ -128,13 +138,13 @@ with st.sidebar:
                 log.exception("URL fetch failed")
 
     st.markdown("---")
-    if st.button("Use example policy"):
+    if st.button("Use example policy", use_container_width=True):
         st.session_state["_ingest_example"] = True
         log_event("example", "Example_Waste_Services_Policy.txt")
         log.info("Example queued")
 
     st.markdown("---")
-    if st.button("🗑️ Clear session & database"):
+    if st.button("🗑️ Clear session & database", use_container_width=True):
         st.session_state["policy_cards"] = []
         st.session_state["store"] = SimpleFAISS.load(VECTOR_DB_NAME)
         try:
@@ -149,6 +159,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Diagnostics")
     backend = "FAISS" if getattr(st.session_state["store"], "index", None) is not None else "NumPy"
+    st.write(f"Brand: **{brand_key}**")
     st.write(f"Vector backend: **{backend}**")
     st.write(f"Indexed docs: **{len(getattr(st.session_state['store'], 'docs', []))}**")
     st.write(f"Retention (days): **{RETENTION_DAYS}** | Purged: **{removed}**")
