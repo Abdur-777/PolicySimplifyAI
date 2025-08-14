@@ -32,7 +32,6 @@ except Exception:
 # ---- OpenAI client (lazy) ----
 def _get_client() -> OpenAI:
     # Let the SDK read OPENAI_API_KEY from the environment.
-    # This avoids passing unexpected kwargs (like proxies) explicitly.
     return OpenAI()
 
 
@@ -154,7 +153,3 @@ class SimpleFAISS:
             store.dim = store._embs.shape[1]
 
         return store
-checklist_generator.py
-python
-Copy
-Edit
