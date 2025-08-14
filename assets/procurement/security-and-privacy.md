@@ -1,25 +1,9 @@
-# Security & Privacy Q&A (Pilot)
+# Security & Privacy Q&A
+Data flow: PDF upload → text extract/OCR → embeddings+prompts to OpenAI/Azure over HTTPS → outputs saved in local SQLite. No training on your data.
 
-**Data flow**  
-PDF is uploaded → text extracted → embeddings + prompts sent to OpenAI for processing → outputs stored in local SQLite. No data used to train models.
-
-**Data retention**  
-Default 14 days (configurable via `RETENTION_DAYS`). Daily purge on startup.
-
-**Access**  
-Passcode gate (`APP_PASSCODE`) for pilot. Production options: reverse-proxy Basic Auth or SSO/SAML.
-
-**Data residency**  
-App + SQLite run where you deploy (Render/Docker/on-prem). OpenAI processing over HTTPS.
-
-**Backups**  
-Pilot default: no backups. Option to nightly copy SQLite.
-
-**Vulnerability & updates**  
-Pinned dependencies; monthly base image refresh; CVE patching as required.
-
-**Logging**  
-Action log (upload/url/example/qa/email/admin). No sensitive payloads in logs.
-
-**Incident response**  
-Email notification within 24h; root cause report on request.
+Retention: default 14 days (configurable), purge job on startup.  
+Access: passcode gate (pilot); production via reverse-proxy Basic Auth or SSO/SAML.  
+Residency: app runs where deployed (Docker/VM); only outbound HTTPS to provider.  
+Backups: optional nightly SQLite copy.  
+Logging: event log (upload/url/example/qa/email/admin); no sensitive contents.  
+Incidents: notify within 24h; RCA on request.
