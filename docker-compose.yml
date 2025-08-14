@@ -1,14 +1,23 @@
-# docker-compose.yml — Day 5
 services:
-  policysimplify:
+  app:
     build: .
     ports:
       - "8080:8080"
+      - "9090:9090"
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      OPENAI_MODEL_CHAT: ${OPENAI_MODEL_CHAT:-gpt-4o-mini}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o-mini}
       APP_PASSCODE: ${APP_PASSCODE}
       COUNCIL_NAME: ${COUNCIL_NAME:-Your Council}
+      VECTOR_DB_NAME: ${VECTOR_DB_NAME:-demo_store}
       RETENTION_DAYS: "30"
+      ENABLE_OCR: ${ENABLE_OCR:-true}
+      API_SECRET: ${API_SECRET:-change-me}
+      ALLOW_DB_EXPORT: ${ALLOW_DB_EXPORT:-true}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER}
