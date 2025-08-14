@@ -1,25 +1,7 @@
-# Core app
-streamlit
-python-dotenv
-
-# Google Cloud
-google-cloud-storage
-
-# LangChain + vector store
-langchain==0.1.16
-langchain-community==0.0.32
-langchain-openai==0.0.8
-faiss-cpu==1.8.0
-tiktoken
-openai>=1.0.0
-
-# Document parsing
-pypdf
-PyPDF2
-python-docx
-python-pptx
-striprtf
-pandas
-xlrd
-requests
-beautifulsoup4
+streamlit==1.36.0
+openai==1.40.0
+python-dotenv==1.0.1
+pypdf==4.3.1
+faiss-cpu==1.8.0.post1
+tqdm==4.66.5
+numpy==1.26.4
