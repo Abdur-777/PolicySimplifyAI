@@ -1,5 +1,5 @@
 # ================================
-# PolicySimplify AI – Full app.py
+# PolicySimplify AI – Full app.py (with test flow help)
 # ================================
 import os, io, json, time
 from datetime import datetime
@@ -19,6 +19,51 @@ st.set_page_config(page_title="PolicySimplify AI", page_icon="✅", layout="wide
 
 TENANT_KEY = st.sidebar.selectbox("Switch brand / tenant", ["wyndham-city", "default"], index=0)
 
+# ================================
+# HELP PANEL — YOUR TEST FLOW
+# ================================
+with st.expander("❓ How this works (test flow) — click to open", expanded=False):
+    st.markdown("""
+**Upload screen**
+- You’ll see the file appear in the uploader box with its name (e.g., `child-safe-policy.pdf`).
+- Click **“Process uploaded PDF”**.
+
+**Processing**
+- A spinner will show:
+  - “Reading policy…”
+  - “Generating summary…”
+  - “Generating checklist…”
+  - “Assessing risk…”
+
+**Confirmation**
+- A green ✅ success message:
+  - `Added child-safe-policy.pdf to wyndham-city.`
+
+**Dashboard table (main view)**
+- A new row at the top of the table:
+  - **Policy** → `child-safe-policy.pdf`
+  - **Summary (plain-English)** → AI-generated summary of the document
+  - **Checklist (actions)** → action points extracted from the policy
+  - **Risk** → “High”, “Medium”, or “Low”
+  - **Risk explainer** → short reasoning for that risk level
+  - **Source Type** → “Uploaded”
+  - **Processed** → today’s date/time
+
+**Details panel (below the table)**
+- When you select the row #, you’ll see:
+  - **Policy name**
+  - **Risk**
+  - **Source Type**
+  - **Processed date**
+  - **Full plain-English summary**
+  - **Checklist (actions)**
+  - **Risk explainer**
+
+**Export**
+- Click:
+  - **Download CSV** → exports the table view
+  - **Download JSON** → exports full details
+""")
 
 # ================================
 # PROCESS POLICY FUNCTION
@@ -86,7 +131,6 @@ def process_policy(
     st.success(f"✅ Added **{source_name}** to **{tenant_key}**.")
     return card
 
-
 # ================================
 # DASHBOARD RENDERER
 # ================================
@@ -126,7 +170,7 @@ def render_dashboard_table(tenant_key: str):
 
     rows = session_rows + saved_rows
     if not rows:
-        st.info("No items yet. Upload a PDF, paste a URL, or preload demo from the sidebar.")
+        st.info("No items yet. Upload a PDF or paste text above.")
         return
 
     df = pd.DataFrame(rows)
@@ -147,8 +191,11 @@ def render_dashboard_table(tenant_key: str):
         view_df = df[df["Risk"].isin(risk_filter)]
 
     view_df = view_df.reset_index(drop=True)
-    st.dataframe(view_df[["Policy","Summary (plain-English)","Checklist (actions)","Risk","Risk explainer","Source Type","Processed"]],
-                 use_container_width=True, height=420)
+    st.dataframe(
+        view_df[["Policy","Summary (plain-English)","Checklist (actions)","Risk","Risk explainer","Source Type","Processed"]],
+        use_container_width=True,
+        height=420
+    )
 
     # Details panel
     st.markdown("#### Policy details")
@@ -180,12 +227,10 @@ def render_dashboard_table(tenant_key: str):
         use_container_width=True
     )
 
-
 # ================================
 # MAIN APP LAYOUT
 # ================================
 st.title("✅ PolicySimplify AI")
-
 st.markdown("### 1) Upload or paste a policy")
 
 upl = st.file_uploader("Upload a PDF", type=["pdf"], key="uploader")
