@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import os, json, time, requests
 from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any
 
 import streamlit as st
 import pandas as pd
+from dotenv import load_dotenv
 
-# Local modules you already have:
-# - pdf_loader.py -> load_pdf(bytes) -> str
-# - checklist_generator.py -> generate_summary, generate_checklist, assess_risk, compose_policy_card
-# - storage.py -> save_policy(tenant, dict), load_policies(tenant)
+# Local modules (keep these files alongside app.py)
 from pdf_loader import load_pdf
 from checklist_generator import (
     generate_summary,
@@ -20,26 +20,32 @@ from checklist_generator import (
     assess_risk,
     compose_policy_card,
 )
-from storage import save_policy, load_policies
+from storage import save_policy, load_policies, clear_policies
 
 # ---------- Fixed tenant (Wyndham only) ----------
 TENANT_KEY  = "wyndham-city"
 TENANT_NAME = "Wyndham City Council"
 
-# ---------- App config ----------
-st.set_page_config(page_title="PolicySimplify AI — Wyndham", page_icon="✅", layout="wide")
+# ---------- Config / Env ----------
+load_dotenv()
+ADMIN_PIN = os.getenv("ADMIN_PIN", "")  # optional; set in .env to enable Admin > Delete All
 
-# ---------- Simple Wyndham branding ----------
+# Branding (logo optional; place file if you have it)
 WYNDHAM_BRAND = {
     "name": TENANT_NAME,
     "primary":   "#0051A5",
     "secondary": "#012B55",
     "accent":    "#00B3A4",
-    # Optional local asset path if you have it in your repo:
-    # "logo": "assets/brands/wyndham.png",
-    "logo": None,
+    "logo": None,  # e.g. "assets/brands/wyndham.png"
 }
 
+# Preload location
+PRELOAD_JSON = "assetssss/preloads/_shared/wyndham-city/demo_policies.json"
+
+st.set_page_config(page_title="PolicySimplify AI — Wyndham", page_icon="✅", layout="wide")
+
+
+# ---------- Branding helpers ----------
 def apply_brand():
     primary   = WYNDHAM_BRAND["primary"]
     secondary = WYNDHAM_BRAND["secondary"]
@@ -58,6 +64,9 @@ def apply_brand():
             background: var(--ps-primary); color:#fff; border:0; border-radius:.5rem; padding:.5rem .9rem;
           }}
           .stButton>button:hover {{ filter: brightness(.95); }}
+          .searchbox input {{
+            border: 1px solid var(--ps-secondary) !important;
+          }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -76,52 +85,6 @@ def apply_brand():
         if logo and os.path.exists(logo):
             st.image(logo, use_column_width=True)
     st.divider()
-
-apply_brand()
-
-# ---------- Help / test flow ----------
-with st.expander("❓ How this works (test flow) — click to open", expanded=False):
-    st.markdown("""
-**Upload screen**
-- You’ll see the file appear in the uploader box with its name (e.g., `child-safe-policy-example.pdf`).
-- Click **“Process uploaded PDF”**.
-
-**Processing**
-- A spinner will show:
-  - “Reading policy…”
-  - “Generating summary…”
-  - “Generating checklist…”
-  - “Assessing risk…”
-
-**Confirmation**
-- A green ✅ success message:
-  - `Added child-safe-policy-example.pdf to wyndham-city.`
-
-**Dashboard table (main view)**
-- A new row at the top of the table:
-  - **Policy** → `child-safe-policy-example.pdf`
-  - **Summary (plain-English)** → AI-generated summary of the document
-  - **Checklist (actions)** → action points extracted from the policy
-  - **Risk** → “High”, “Medium”, or “Low”
-  - **Risk explainer** → short reasoning for that risk level
-  - **Source Type** → “Uploaded”
-  - **Processed** → today’s date/time
-
-**Details panel (below the table)**
-- When you select the row #, you’ll see:
-  - **Policy name**
-  - **Risk**
-  - **Source Type**
-  - **Processed date**
-  - **Full plain-English summary**
-  - **Checklist (actions)**
-  - **Risk explainer**
-
-**Export**
-- Click:
-  - **Download CSV** → exports the table view
-  - **Download JSON** → exports full details
-""")
 
 
 # ---------- Core pipeline ----------
@@ -185,8 +148,28 @@ def process_policy(
     return card
 
 
+def _load_preload_list() -> List[Dict[str, Any]]:
+    """Load a list of {'name': '...', 'url': 'https://...pdf'} from demo_policies.json."""
+    fp = Path(PRELOAD_JSON)
+    if not fp.exists():
+        return []
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        out = []
+        if isinstance(data, list):
+            for item in data:
+                url = item.get("url")
+                nm  = item.get("name") or (os.path.basename(url) if url else "Policy.pdf")
+                if url and url.lower().endswith(".pdf"):
+                    out.append({"name": nm, "url": url})
+        return out
+    except Exception as e:
+        st.warning(f"Invalid JSON in {PRELOAD_JSON}: {e}")
+        return []
+
+
 def render_dashboard_table(tenant_key: str):
-    """Merged table: Saved compact records + full session cards."""
+    """Merged table: Saved compact records + full session cards + search & filters."""
     # Saved compact records (from storage.py)
     saved = load_policies(tenant_key)
     saved_rows = []
@@ -222,7 +205,7 @@ def render_dashboard_table(tenant_key: str):
     rows = session_rows + saved_rows
     st.markdown("### 2) Active compliance items")
     if not rows:
-        st.info("No items yet. Upload a PDF or use the sample button above.")
+        st.info("No items yet. Upload a PDF or use Preload in the sidebar.")
         return
 
     df = pd.DataFrame(rows)
@@ -230,18 +213,25 @@ def render_dashboard_table(tenant_key: str):
     df["_r"] = df["Risk"].map(order_risk).fillna(3)
     df = df.sort_values(by=["_source", "_r", "_created_ts"], ascending=[True, True, False]).drop(columns=["_r","_created_ts"])
 
-    left, right = st.columns([0.7, 0.3])
-    with left:
-        risk_filter = st.multiselect("Filter by risk", ["High","Medium","Low"], default=["High","Medium","Low"])
-    with right:
-        high_only = st.checkbox("High risk only", value=False)
+    # Search + filters
+    colL, colR = st.columns([0.72, 0.28])
+    with colL:
+        q = st.text_input("Search (title/summary/checklist)", key="search_q", placeholder="e.g., child safety, recycling", help="Filters rows containing these keywords.")
+    with colR:
+        risk_filter = st.multiselect("Risk filter", ["High","Medium","Low"], default=["High","Medium","Low"])
 
-    if high_only:
-        view_df = df[df["Risk"].eq("High")]
-    else:
-        view_df = df[df["Risk"].isin(risk_filter)]
+    if q:
+        q_lower = q.lower()
+        df = df[
+            df["Policy"].str.lower().str.contains(q_lower) |
+            df["Summary (plain-English)"].str.lower().str.contains(q_lower) |
+            df["Checklist (actions)"].str.lower().str.contains(q_lower)
+        ]
 
-    view_df = view_df.reset_index(drop=True)
+    if risk_filter:
+        df = df[df["Risk"].isin(risk_filter)]
+
+    view_df = df.reset_index(drop=True)
     st.dataframe(
         view_df[["Policy","Summary (plain-English)","Checklist (actions)","Risk","Risk explainer","Source Type","Processed"]],
         use_container_width=True, height=420
@@ -275,39 +265,100 @@ def render_dashboard_table(tenant_key: str):
         use_container_width=True
     )
 
+    # --- Audit Pack (PDF) — stub now writes TXT to avoid extra deps
+    st.markdown("#### Audit Pack")
+    if st.button("Generate Audit Pack (TXT)"):
+        if len(view_df) == 0:
+            st.warning("Nothing to export.")
+        else:
+            # Build a simple text pack
+            lines = []
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            lines.append(f"PolicySimplify AI — Audit Pack ({TENANT_NAME}) — {ts}")
+            lines.append("="*80)
+            for i, r in view_df.iterrows():
+                lines.append(f"\n[{i+1}] {r['Policy']}")
+                lines.append(f"Risk: {r.get('Risk','')}")
+                lines.append(f"Processed: {r.get('Processed','')}")
+                lines.append("\nSummary:\n" + (r.get("Summary (plain-English)","") or ""))
+                cl = r.get("Checklist (actions)","") or ""
+                lines.append("\nChecklist:\n" + cl)
+                lines.append("\n" + "-"*60)
 
-# ---------- Main layout (Wyndham only) ----------
-st.title("✅ PolicySimplify AI — Wyndham")
-st.markdown("### 1) Upload or test a policy")
-
-colA, colB = st.columns(2)
-
-with colA:
-    upl = st.file_uploader("Upload a PDF", type=["pdf"], key="uploader")
-    if upl is not None and st.button("Process uploaded PDF", use_container_width=True):
-        process_policy(source_name=upl.name, tenant_key=TENANT_KEY, file_bytes=upl.read())
-
-with colB:
-    if st.button("▶️ Test with sample PDF (Vic Child Safe Policy)", use_container_width=True):
-        demo_url = "https://www.vic.gov.au/sites/default/files/2021-04/child-safe-policy-example.pdf"
-        try:
-            r = requests.get(demo_url, timeout=30)
-            r.raise_for_status()
-            process_policy(
-                source_name="child-safe-policy-example.pdf",
-                tenant_key=TENANT_KEY,
-                file_bytes=r.content,
-                source_type="URL"
+            txt = "\n".join(lines).encode("utf-8")
+            st.download_button(
+                "Download Audit Pack (TXT)",
+                data=txt,
+                file_name="audit_pack_wyndham.txt",
+                mime="text/plain",
+                use_container_width=True
             )
-        except Exception as e:
-            st.error(f"Demo fetch failed: {e}")
+            st.info("This is a lightweight TXT export. Swap to a real PDF generator later (e.g., `reportlab` or `fpdf`).")
 
-# Optional: paste raw text
-txt = st.text_area("...or paste raw policy text")
-if txt.strip() and st.button("Process pasted text", use_container_width=True):
-    process_policy(source_name="pasted-policy.txt", tenant_key=TENANT_KEY, raw_text=txt)
 
-# Dashboard table
+# ---------- App UI ----------
+apply_brand()
+
+# Help / test flow
+with st.expander("❓ How this works — click to open", expanded=False):
+    st.markdown("""
+**Upload**
+1) Choose a PDF, then click **Process uploaded PDF**.
+
+**What you’ll see**
+- Spinners: *Reading policy → Generating summary → Generating checklist → Assessing risk*
+- ✅ Success toast
+- A new row appears at the top of the **Active compliance items** table
+- Select a row to view **Summary**, **Checklist**, **Risk explainer**
+
+**Exports**
+- Download CSV/JSON
+- Generate **Audit Pack (TXT)** (swap to PDF later)
+""")
+
+# Sidebar — Upload / Paste / Preload / Admin
+st.sidebar.markdown("### Ingest a policy")
+upl = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
+if upl and st.sidebar.button("Process uploaded PDF"):
+    process_policy(source_name=upl.name, tenant_key=TENANT_KEY, file_bytes=upl.read())
+
+raw = st.sidebar.text_area("...or paste raw policy text")
+if raw.strip() and st.sidebar.button("Process pasted text"):
+    process_policy(source_name="pasted-policy.txt", tenant_key=TENANT_KEY, raw_text=raw)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Preload (Wyndham)")
+if st.sidebar.button("Preload demo_policies.json"):
+    items = _load_preload_list()
+    if not items:
+        st.sidebar.warning(f"No preloads found at {PRELOAD_JSON}")
+    else:
+        added = 0
+        for item in items:
+            try:
+                r = requests.get(item["url"], timeout=30)
+                r.raise_for_status()
+                process_policy(source_name=item["name"], tenant_key=TENANT_KEY, file_bytes=r.content, source_type="URL")
+                added += 1
+            except Exception as e:
+                st.sidebar.error(f"Failed {item.get('name','(unknown)')}: {e}")
+        st.sidebar.success(f"Preloaded {added} document(s).")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Admin")
+pin = st.sidebar.text_input("Enter admin PIN", type="password")
+if st.sidebar.button("🗑️ Delete ALL saved items") and ADMIN_PIN:
+    if pin == ADMIN_PIN:
+        ok = clear_policies(TENANT_KEY)
+        st.sidebar.success("Deleted saved compact records for this tenant.")
+    else:
+        st.sidebar.error("Wrong PIN.")
+elif ADMIN_PIN == "":
+    st.sidebar.caption("Set ADMIN_PIN in .env to enable delete.")
+
+
+# ---------- Main sections ----------
+st.markdown("### 1) Dashboard")
 render_dashboard_table(TENANT_KEY)
 
 st.caption("© 2025 PolicySimplify AI — Wyndham demo")
